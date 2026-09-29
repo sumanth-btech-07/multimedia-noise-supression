@@ -1,0 +1,380 @@
+"""
+Feature Extraction Module - OPTIMIZED VERSION
+Extracts time-domain and frequency-domain features for noise suppression
+Memory-efficient implementation
+"""
+
+import numpy as np
+import librosa
+import soundfile as sf
+from scipy import signal
+from pathlib import Path
+import pickle
+from tqdm import tqdm
+import gc
+
+class FeatureExtractor:
+    def __init__(self, sr=16000, n_fft=512, hop_length=256, n_mels=64):
+        """
+        Initialize feature extractor
+        
+        Args:
+            sr: Sampling rate
+            n_fft: FFT size
+            hop_length: Hop length for STFT
+            n_mels: Number of mel bands
+        """
+        self.sr = sr
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.n_mels = n_mels
+        self.win_length = n_fft
+    
+    def extract_stft_features(self, audio):
+        """Extract STFT features - memory efficient"""
+        # Compute STFT
+        stft = librosa.stft(
+            audio, 
+            n_fft=self.n_fft, 
+            hop_length=self.hop_length,
+            win_length=self.win_length,
+            window='hann'
+        )
+        
+        # Magnitude and phase
+        magnitude = np.abs(stft).astype(np.float32)
+        phase = np.angle(stft).astype(np.float32)
+        
+        # Log magnitude
+        log_magnitude = np.log1p(magnitude).astype(np.float32)
+        
+        return {
+            'magnitude': magnitude,
+            'phase': phase,
+            'log_magnitude': log_magnitude
+        }
+    
+    def extract_mel_spectrogram(self, audio):
+        """Extract mel-spectrogram features - memory efficient"""
+        mel_spec = librosa.feature.melspectrogram(
+            y=audio,
+            sr=self.sr,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            n_mels=self.n_mels,
+            fmax=self.sr // 2
+        )
+        
+        # Convert to log scale - float32 to save memory
+        log_mel_spec = librosa.power_to_db(mel_spec, ref=np.max).astype(np.float32)
+        
+        return {
+            'log_mel_spectrogram': log_mel_spec
+        }
+    
+    def extract_spectral_features(self, audio):
+        """Extract spectral features - memory efficient"""
+        # Spectral centroid
+        spectral_centroid = librosa.feature.spectral_centroid(
+            y=audio, sr=self.sr, n_fft=self.n_fft, hop_length=self.hop_length
+        ).astype(np.float32)
+        
+        # Zero crossing rate
+        zcr = librosa.feature.zero_crossing_rate(
+            audio, frame_length=self.n_fft, hop_length=self.hop_length
+        ).astype(np.float32)
+        
+        return {
+            'spectral_centroid': spectral_centroid,
+            'zero_crossing_rate': zcr
+        }
+    
+    def extract_essential_features(self, audio):
+        """Extract only essential features to save memory"""
+        features = {}
+        
+        # STFT features (most important)
+        stft_features = self.extract_stft_features(audio)
+        features.update(stft_features)
+        
+        # Mel spectrogram (for visualization)
+        mel_features = self.extract_mel_spectrogram(audio)
+        features.update(mel_features)
+        
+        # Basic spectral features
+        spectral_features = self.extract_spectral_features(audio)
+        features.update(spectral_features)
+        
+        return features
+
+class DatasetFeatureExtractor:
+    def __init__(self, dataset_dir='datasets', output_dir='features'):
+        """Initialize dataset feature extractor"""
+        self.dataset_dir = Path(dataset_dir)
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+        
+        self.feature_extractor = FeatureExtractor()
+    
+    def process_dataset_streaming(self, subset='train', batch_size=100):
+        """
+        Process dataset in batches to avoid memory issues
+        
+        Args:
+            subset: 'train' or 'test'
+            batch_size: Number of files to process before saving
+        """
+        print(f"Processing {subset} dataset (streaming mode)...")
+        
+        noisy_dir = self.dataset_dir / subset / 'noisy'
+        clean_dir = self.dataset_dir / subset / 'clean'
+        
+        if not noisy_dir.exists() or not clean_dir.exists():
+            print(f"Error: {subset} dataset not found!")
+            return
+        
+        noisy_files = sorted(list(noisy_dir.glob('*.wav')))
+        clean_files = sorted(list(clean_dir.glob('*.wav')))
+        
+        print(f"Found {len(noisy_files)} files")
+        
+        # Process in batches
+        num_batches = (len(noisy_files) + batch_size - 1) // batch_size
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(noisy_files))
+            
+            print(f"\nProcessing batch {batch_idx + 1}/{num_batches} ({start_idx}-{end_idx})")
+            
+            batch_noisy_files = noisy_files[start_idx:end_idx]
+            batch_clean_files = clean_files[start_idx:end_idx]
+            
+            noisy_features_list = []
+            clean_features_list = []
+            
+            for noisy_file, clean_file in tqdm(
+                zip(batch_noisy_files, batch_clean_files),
+                total=len(batch_noisy_files),
+                desc=f"Batch {batch_idx + 1}"
+            ):
+                try:
+                    # Load audio
+                    noisy_audio, _ = sf.read(noisy_file)
+                    clean_audio, _ = sf.read(clean_file)
+                    
+                    # Extract features
+                    noisy_features = self.feature_extractor.extract_essential_features(noisy_audio)
+                    clean_features = self.feature_extractor.extract_essential_features(clean_audio)
+                    
+                    noisy_features_list.append(noisy_features)
+                    clean_features_list.append(clean_features)
+                    
+                except Exception as e:
+                    print(f"\nError processing {noisy_file.name}: {e}")
+                    continue
+            
+            # Save batch
+            batch_output_file = self.output_dir / f'{subset}_features_batch_{batch_idx}.pkl'
+            with open(batch_output_file, 'wb') as f:
+                pickle.dump({
+                    'noisy': noisy_features_list,
+                    'clean': clean_features_list
+                }, f)
+            
+            print(f"Batch {batch_idx + 1} saved to {batch_output_file}")
+            
+            # Clear memory
+            del noisy_features_list
+            del clean_features_list
+            gc.collect()
+        
+        # Merge batches
+        print(f"\nMerging batches...")
+        self._merge_batches(subset, num_batches)
+        
+        print(f"Features saved successfully!")
+    
+    def _merge_batches(self, subset, num_batches):
+        """Merge batch files into single file"""
+        all_noisy = []
+        all_clean = []
+        
+        for batch_idx in range(num_batches):
+            batch_file = self.output_dir / f'{subset}_features_batch_{batch_idx}.pkl'
+            
+            if batch_file.exists():
+                with open(batch_file, 'rb') as f:
+                    batch_data = pickle.load(f)
+                    all_noisy.extend(batch_data['noisy'])
+                    all_clean.extend(batch_data['clean'])
+                
+                # Delete batch file
+                batch_file.unlink()
+        
+        # Save merged file
+        output_file = self.output_dir / f'{subset}_features.pkl'
+        with open(output_file, 'wb') as f:
+            pickle.dump({
+                'noisy': all_noisy,
+                'clean': all_clean
+            }, f)
+        
+        print(f"Merged features saved to {output_file}")
+    
+    def create_frame_based_dataset(self, subset='train', context_frames=5, 
+                                   max_samples=None):
+        """
+        Create frame-based dataset for deep learning - memory efficient
+        
+        Args:
+            subset: 'train' or 'test'
+            context_frames: Number of context frames
+            max_samples: Maximum number of samples (None for all)
+        """
+        print(f"\nCreating frame-based {subset} dataset...")
+        
+        # Load features
+        feature_file = self.output_dir / f'{subset}_features.pkl'
+        
+        if not feature_file.exists():
+            print("Extracting features first...")
+            self.process_dataset_streaming(subset)
+        
+        print("Loading features...")
+        with open(feature_file, 'rb') as f:
+            features_dict = pickle.load(f)
+        
+        noisy_features_list = features_dict['noisy']
+        clean_features_list = features_dict['clean']
+        
+        print(f"Loaded {len(noisy_features_list)} feature sets")
+        
+        # Use subset of data if specified
+        if max_samples and max_samples < len(noisy_features_list):
+            print(f"Using first {max_samples} samples")
+            noisy_features_list = noisy_features_list[:max_samples]
+            clean_features_list = clean_features_list[:max_samples]
+        
+        # Prepare frame-based data
+        X_magnitude = []
+        X_phase = []
+        Y_magnitude = []
+        Y_phase = []
+        
+        print("Creating frames...")
+        for idx, (noisy_feat, clean_feat) in enumerate(tqdm(
+            zip(noisy_features_list, clean_features_list),
+            desc="Creating frames",
+            total=len(noisy_features_list)
+        )):
+            try:
+                noisy_mag = noisy_feat['magnitude']
+                noisy_phase = noisy_feat['phase']
+                clean_mag = clean_feat['magnitude']
+                clean_phase = clean_feat['phase']
+                
+                n_frames = noisy_mag.shape[1]
+                
+                # Create context windows
+                for i in range(context_frames, n_frames - context_frames):
+                    # Input: context frames of noisy magnitude
+                    x_mag = noisy_mag[:, i-context_frames:i+context_frames+1]
+                    x_phase = noisy_phase[:, i]
+                    
+                    # Target: clean magnitude at current frame
+                    y_mag = clean_mag[:, i]
+                    y_phase = clean_phase[:, i]
+                    
+                    X_magnitude.append(x_mag.flatten().astype(np.float32))
+                    X_phase.append(x_phase.astype(np.float32))
+                    Y_magnitude.append(y_mag.astype(np.float32))
+                    Y_phase.append(y_phase.astype(np.float32))
+                
+                # Periodic garbage collection
+                if (idx + 1) % 100 == 0:
+                    gc.collect()
+                    
+            except Exception as e:
+                print(f"\nError processing sample {idx}: {e}")
+                continue
+        
+        # Convert to numpy arrays
+        print("Converting to numpy arrays...")
+        X_magnitude = np.array(X_magnitude, dtype=np.float32)
+        X_phase = np.array(X_phase, dtype=np.float32)
+        Y_magnitude = np.array(Y_magnitude, dtype=np.float32)
+        Y_phase = np.array(Y_phase, dtype=np.float32)
+        
+        print(f"Frame-based dataset shape:")
+        print(f"  X_magnitude: {X_magnitude.shape}")
+        print(f"  Y_magnitude: {Y_magnitude.shape}")
+        
+        # Save
+        output_file = self.output_dir / f'{subset}_frame_dataset.npz'
+        print(f"Saving to {output_file}...")
+        
+        np.savez_compressed(
+            output_file,
+            X_magnitude=X_magnitude,
+            X_phase=X_phase,
+            Y_magnitude=Y_magnitude,
+            Y_phase=Y_phase
+        )
+        
+        print(f"Frame-based dataset saved!")
+        
+        # Clear memory
+        del X_magnitude, X_phase, Y_magnitude, Y_phase
+        gc.collect()
+        
+        return output_file
+
+def main():
+    """Main execution"""
+    print("=" * 60)
+    print("FEATURE EXTRACTION - OPTIMIZED VERSION")
+    print("=" * 60)
+    
+    extractor = DatasetFeatureExtractor()
+    
+    # Process train and test datasets with batching
+    print("\n[1/4] Extracting training features (batched)...")
+    try:
+        extractor.process_dataset_streaming('train', batch_size=200)
+    except Exception as e:
+        print(f"Error in training feature extraction: {e}")
+        print("Trying with smaller batch size...")
+        extractor.process_dataset_streaming('train', batch_size=100)
+    
+    print("\n[2/4] Extracting test features (batched)...")
+    try:
+        extractor.process_dataset_streaming('test', batch_size=100)
+    except Exception as e:
+        print(f"Error in test feature extraction: {e}")
+        print("Continuing anyway...")
+    
+    # Create frame-based datasets
+    print("\n[3/4] Creating frame-based training dataset...")
+    try:
+        # For training, use a subset to save memory
+        extractor.create_frame_based_dataset('train', context_frames=5, max_samples=4000)
+    except Exception as e:
+        print(f"Error creating training frames: {e}")
+        print("Trying with smaller subset...")
+        extractor.create_frame_based_dataset('train', context_frames=5, max_samples=2000)
+    
+    print("\n[4/4] Creating frame-based test dataset...")
+    try:
+        extractor.create_frame_based_dataset('test', context_frames=5, max_samples=None)
+    except Exception as e:
+        print(f"Error creating test frames: {e}")
+    
+    print("\n" + "=" * 60)
+    print("FEATURE EXTRACTION COMPLETE!")
+    print("=" * 60)
+    print("\nNote: Features are saved in float32 format to save memory")
+    print("Frame-based datasets are ready for training")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,411 @@
+"""
+Training Script for ARN-based Noise Suppression
+Implements training loop with various loss functions and evaluation metrics
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import soundfile as sf
+import librosa
+from pathlib import Path
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import pickle
+from arn_model import ARNModel, TimeInvariantMaskingModel
+import warnings
+warnings.filterwarnings('ignore')
+
+class NoisyCleanDataset(Dataset):
+    """Dataset for noisy-clean speech pairs - Memory optimized"""
+    def __init__(self, dataset_dir, subset='train', sequence_length=128, max_files=None):
+        self.dataset_dir = Path(dataset_dir)
+        self.subset = subset
+        self.sequence_length = sequence_length
+        
+        # Load file paths
+        self.noisy_dir = self.dataset_dir / subset / 'noisy'
+        self.clean_dir = self.dataset_dir / subset / 'clean'
+        
+        self.noisy_files = sorted(list(self.noisy_dir.glob('*.wav')))
+        self.clean_files = sorted(list(self.clean_dir.glob('*.wav')))
+        
+        # Limit number of files if specified
+        if max_files and max_files < len(self.noisy_files):
+            print(f"Limiting to {max_files} files for memory efficiency")
+            self.noisy_files = self.noisy_files[:max_files]
+            self.clean_files = self.clean_files[:max_files]
+        
+        assert len(self.noisy_files) == len(self.clean_files)
+        
+        print(f"Loaded {len(self.noisy_files)} files from {subset} set")
+        
+        # STFT parameters
+        self.n_fft = 512
+        self.hop_length = 256
+        self.sr = 16000
+    
+    def __len__(self):
+        return len(self.noisy_files)
+    
+    def compute_stft(self, audio):
+        """Compute STFT"""
+        stft = librosa.stft(
+            audio,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            window='hann'
+        )
+        magnitude = np.abs(stft)
+        phase = np.angle(stft)
+        return magnitude, phase
+    
+    def __getitem__(self, idx):
+        # Load audio
+        noisy_audio, _ = sf.read(self.noisy_files[idx])
+        clean_audio, _ = sf.read(self.clean_files[idx])
+        
+        # Ensure same length
+        min_len = min(len(noisy_audio), len(clean_audio))
+        noisy_audio = noisy_audio[:min_len]
+        clean_audio = clean_audio[:min_len]
+        
+        # Compute STFT
+        noisy_mag, noisy_phase = self.compute_stft(noisy_audio)
+        clean_mag, clean_phase = self.compute_stft(clean_audio)
+        
+        # Transpose to (time, freq)
+        noisy_mag = noisy_mag.T
+        clean_mag = clean_mag.T
+        noisy_phase = noisy_phase.T
+        
+        # Log compression
+        noisy_mag_log = np.log1p(noisy_mag)
+        clean_mag_log = np.log1p(clean_mag)
+        
+        # Compute ideal ratio mask (IRM)
+        irm = clean_mag / (noisy_mag + 1e-8)
+        irm = np.clip(irm, 0, 1)
+        
+        # Random crop to sequence length
+        if noisy_mag_log.shape[0] > self.sequence_length:
+            start_idx = np.random.randint(0, noisy_mag_log.shape[0] - self.sequence_length)
+            noisy_mag_log = noisy_mag_log[start_idx:start_idx+self.sequence_length]
+            clean_mag_log = clean_mag_log[start_idx:start_idx+self.sequence_length]
+            irm = irm[start_idx:start_idx+self.sequence_length]
+            noisy_phase = noisy_phase[start_idx:start_idx+self.sequence_length]
+        else:
+            # Pad if necessary
+            pad_len = self.sequence_length - noisy_mag_log.shape[0]
+            if pad_len > 0:
+                noisy_mag_log = np.pad(noisy_mag_log, ((0, pad_len), (0, 0)))
+                clean_mag_log = np.pad(clean_mag_log, ((0, pad_len), (0, 0)))
+                irm = np.pad(irm, ((0, pad_len), (0, 0)))
+                noisy_phase = np.pad(noisy_phase, ((0, pad_len), (0, 0)))
+        
+        return {
+            'noisy_mag': torch.FloatTensor(noisy_mag_log),
+            'clean_mag': torch.FloatTensor(clean_mag_log),
+            'irm': torch.FloatTensor(irm),
+            'phase': torch.FloatTensor(noisy_phase)
+        }
+
+class NoiseSuppres sionTrainer:
+    """Trainer for noise suppression models"""
+    def __init__(
+        self,
+        model,
+        device='cuda',
+        learning_rate=0.0001,
+        model_dir='models'
+    ):
+        self.model = model.to(device)
+        self.device = device
+        self.model_dir = Path(model_dir)
+        self.model_dir.mkdir(exist_ok=True)
+        
+        # Optimizer
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=learning_rate
+        )
+        
+        # Loss function
+        self.mse_loss = nn.MSELoss()
+        self.l1_loss = nn.L1Loss()
+        
+        # History
+        self.train_losses = []
+        self.val_losses = []
+    
+    def compute_loss(self, pred_mask, target_mask, noisy_mag):
+        """
+        Compute combined loss
+        
+        Args:
+            pred_mask: Predicted mask
+            target_mask: Target mask (IRM)
+            noisy_mag: Noisy magnitude
+        """
+        # Mask loss (MSE)
+        mask_loss = self.mse_loss(pred_mask, target_mask)
+        
+        # Magnitude loss (L1)
+        pred_clean = pred_mask * torch.exp(noisy_mag) - 1
+        target_clean = target_mask * torch.exp(noisy_mag) - 1
+        mag_loss = self.l1_loss(pred_clean, target_clean)
+        
+        # Combined loss
+        total_loss = mask_loss + 0.5 * mag_loss
+        
+        return total_loss, mask_loss, mag_loss
+    
+    def train_epoch(self, train_loader):
+        """Train for one epoch"""
+        self.model.train()
+        total_loss = 0
+        total_mask_loss = 0
+        total_mag_loss = 0
+        
+        pbar = tqdm(train_loader, desc='Training')
+        for batch in pbar:
+            noisy_mag = batch['noisy_mag'].to(self.device)
+            target_irm = batch['irm'].to(self.device)
+            
+            # Forward pass
+            pred_mask, _ = self.model(noisy_mag)
+            
+            # Compute loss
+            loss, mask_loss, mag_loss = self.compute_loss(
+                pred_mask, target_irm, noisy_mag
+            )
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+            self.optimizer.step()
+            
+            # Accumulate losses
+            total_loss += loss.item()
+            total_mask_loss += mask_loss.item()
+            total_mag_loss += mag_loss.item()
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'mask': f'{mask_loss.item():.4f}',
+                'mag': f'{mag_loss.item():.4f}'
+            })
+        
+        avg_loss = total_loss / len(train_loader)
+        avg_mask_loss = total_mask_loss / len(train_loader)
+        avg_mag_loss = total_mag_loss / len(train_loader)
+        
+        return avg_loss, avg_mask_loss, avg_mag_loss
+    
+    def validate(self, val_loader):
+        """Validate model"""
+        self.model.eval()
+        total_loss = 0
+        total_mask_loss = 0
+        total_mag_loss = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc='Validation'):
+                noisy_mag = batch['noisy_mag'].to(self.device)
+                target_irm = batch['irm'].to(self.device)
+                
+                # Forward pass
+                pred_mask, _ = self.model(noisy_mag)
+                
+                # Compute loss
+                loss, mask_loss, mag_loss = self.compute_loss(
+                    pred_mask, target_irm, noisy_mag
+                )
+                
+                total_loss += loss.item()
+                total_mask_loss += mask_loss.item()
+                total_mag_loss += mag_loss.item()
+        
+        avg_loss = total_loss / len(val_loader)
+        avg_mask_loss = total_mask_loss / len(val_loader)
+        avg_mag_loss = total_mag_loss / len(val_loader)
+        
+        return avg_loss, avg_mask_loss, avg_mag_loss
+    
+    def train(self, train_loader, val_loader, num_epochs=30):
+        """Full training loop"""
+        print("\n" + "="*60)
+        print("TRAINING STARTED")
+        print("="*60)
+        
+        best_val_loss = float('inf')
+        patience = 5
+        patience_counter = 0
+        
+        for epoch in range(num_epochs):
+            print(f"\nEpoch {epoch+1}/{num_epochs}")
+            print("-" * 60)
+            
+            # Train
+            train_loss, train_mask_loss, train_mag_loss = self.train_epoch(train_loader)
+            
+            # Validate
+            val_loss, val_mask_loss, val_mag_loss = self.validate(val_loader)
+            
+            # Store history
+            self.train_losses.append(train_loss)
+            self.val_losses.append(val_loss)
+            
+            print(f"\nEpoch {epoch+1} Summary:")
+            print(f"  Train Loss: {train_loss:.4f} (Mask: {train_mask_loss:.4f}, Mag: {train_mag_loss:.4f})")
+            print(f"  Val Loss:   {val_loss:.4f} (Mask: {val_mask_loss:.4f}, Mag: {val_mag_loss:.4f})")
+            
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                self.save_model(f'best_model_epoch{epoch+1}.pth')
+                print(f"  ✓ New best model saved! (Val Loss: {val_loss:.4f})")
+            else:
+                patience_counter += 1
+                print(f"  Patience: {patience_counter}/{patience}")
+            
+            # Early stopping
+            if patience_counter >= patience:
+                print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                break
+            
+            # Save checkpoint
+            if (epoch + 1) % 5 == 0:
+                self.save_model(f'checkpoint_epoch{epoch+1}.pth')
+        
+        print("\n" + "="*60)
+        print("TRAINING COMPLETED")
+        print("="*60)
+        
+        # Plot training history
+        self.plot_training_history()
+    
+    def save_model(self, filename):
+        """Save model checkpoint"""
+        filepath = self.model_dir / filename
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses
+        }, filepath)
+    
+    def load_model(self, filename):
+        """Load model checkpoint"""
+        filepath = self.model_dir / filename
+        checkpoint = torch.load(filepath, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.train_losses = checkpoint['train_losses']
+        self.val_losses = checkpoint['val_losses']
+        print(f"Model loaded from {filepath}")
+    
+    def plot_training_history(self):
+        """Plot training history"""
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.train_losses, label='Train Loss', linewidth=2)
+        plt.plot(self.val_losses, label='Validation Loss', linewidth=2)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.title('Training History', fontsize=14, fontweight='bold')
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        save_path = self.model_dir / 'training_history.png'
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Training history saved to {save_path}")
+        plt.close()
+
+def main():
+    """Main training function"""
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create datasets with memory limits
+    print("\nLoading datasets...")
+    
+    # Limit training data for memory efficiency
+    max_train_files = 4000  # Use 4000 instead of 8000
+    max_test_files = 400
+    
+    train_dataset = NoisyCleanDataset(
+        'datasets', 
+        subset='train', 
+        sequence_length=128,
+        max_files=max_train_files
+    )
+    test_dataset = NoisyCleanDataset(
+        'datasets', 
+        subset='test', 
+        sequence_length=128,
+        max_files=max_test_files
+    )
+    
+    # Adjust batch size based on available memory
+    batch_size = 8 if device.type == 'cuda' else 4
+    num_workers = 2  # Reduce workers to save memory
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True if device.type == 'cuda' else False
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True if device.type == 'cuda' else False
+    )
+    
+    print(f"Train batches: {len(train_loader)}")
+    print(f"Test batches: {len(test_loader)}")
+    print(f"Batch size: {batch_size}")
+    
+    # Create model
+    print("\nCreating ARN model...")
+    model = ARNModel(
+        input_size=257,
+        hidden_size=512,
+        num_layers=4,
+        dropout=0.05
+    )
+    
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {num_params:,}")
+    
+    # Create trainer
+    trainer = NoiseSuppressionTrainer(
+        model=model,
+        device=device,
+        learning_rate=0.0001,
+        model_dir='models'
+    )
+    
+    # Train model
+    trainer.train(
+        train_loader=train_loader,
+        val_loader=test_loader,
+        num_epochs=30
+    )
+    
+    print("\nTraining completed successfully!")
+
+if __name__ == "__main__":
+    main()
